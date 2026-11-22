@@ -1,0 +1,958 @@
+#!/bin/sh
+# tprompt - prompt for named inputs, print name=value lines.
+# Standalone; tmux-optional; fzf-optional. POSIX sh + awk.
+#
+# Two spec forms:
+#   B (positional):  'name|prompt|default[|values]'   (repeatable)
+#   C (stdin):       key=value lines, blank-line separated:
+#                      name=, prompt=, default=, values=,
+#                      default-env=VAR, values-env=VAR,
+#                      secret=1, multi=1
+#
+# A leading '*' on the name marks a secret (hidden entry): '*pw|Password:'.
+# --multi makes every values-list input multi-select; C 'multi=1' is per-spec.
+# --sep <char> sets the multi-value output separator (default ',').
+# --color[=always|auto|never] colorizes the prompt label + default hint;
+#   ANSI codes in a values list are rendered in the picker and stripped from
+#   the output.
+#
+# Output: one 'name=value' line per input, in order, on stdout.
+# Cancel (EOF / Esc / Ctrl-C on a prompt): exit non-zero, no stdout.
+# Env: $VAR and ${VAR} expanded in default/values/prompt fields.
+#
+# See man/tprompt.1 and docs/usage.md.
+
+TPROMPT_VERSION='0.2.0'
+TAB=$(printf '\t')
+# internal spec-record field separator: ASCII Unit Separator (0x1f).
+# Non-whitespace so `read` preserves empty fields (tab would coalesce them).
+TP_SEP=$(printf '\037')
+
+# color CSI sequences (display only, stderr)
+TP_C_NAME=$(printf '\033[1;36m')      # bold cyan  — prompt label
+TP_C_DEFAULT=$(printf '\033[2;33m')   # dim yellow — default hint
+TP_C_RESET=$(printf '\033[0m')
+
+# awk function: expand $VAR / ${VAR} in a string using ENVIRON.
+# Defined once as a string; reused by tp_expand and tp_parse_c.
+TP_EXPAND_AWK='function tp_xpand(s,   out,i,n,c,m,var) {
+    out=""; i=1; n=length(s)
+    while (i<=n) {
+        c=substr(s,i,1)
+        if (c=="$") {
+            if (substr(s,i+1,1)=="{") {
+                m=index(substr(s,i+2),"}")
+                if (m>0) { var=substr(s,i+2,m-1); out=out ENVIRON[var]; i=i+2+m }
+                else { out=out c; i++ }
+            } else {
+                m=substr(s,i+1)
+                if (match(m,/^[A-Za-z_][A-Za-z0-9_]*/)) { var=substr(m,RSTART,RLENGTH); out=out ENVIRON[var]; i=i+1+RLENGTH }
+                else { out=out c; i++ }
+            }
+        } else { out=out c; i++ }
+    }
+    return out
+}'
+
+tp_usage() {
+    cat <<'EOF'
+usage: tprompt [--in-shell|--new-shell|--popup] [--interactive|--scripted]
+               [--picker fzf|numbered|<cmd>] [--no-tmux] [--no-fzf]
+               [--color[=always|auto|never]] [--multi] [--sep <char>] [--trim|--no-trim]
+               [--validate <re>] [--retry <n>] [--header <text>] [--width <n>] [--height <n>] [--auto-size] [--json] [--json-array]
+               [--label-color <spec>] [--default-color <spec>] [--theme <name>] [--save <file>] [--load <file>] [--multiline] [--sentinel <s>] [--timeout <n>] [--history <file>] [--print-spec] [--specs-from <file>] [-h] [-V]
+               ['name|prompt|default[|values]' ...]
+
+mode:
+  --in-shell        prompt in the current shell (default without tmux)
+  --new-shell       prompt in a fresh shell (tmux popup if available)
+  --popup           prompt in a tmux display-popup
+  --no-tmux         never use tmux (popup/new-shell degrade to in-shell)
+
+interaction:
+  --interactive     force prompting (default when stdin is a tty)
+  --scripted        force non-interactive (default when stdin is a pipe)
+  --picker <p>      picker for values-lists: fzf | numbered | <command>
+  --no-fzf          never use fzf (force numbered)
+
+multi, color, trim:
+  --multi           allow multiple values per values-list input
+  --sep <char>      separator for joined multi-values (default ',')
+  --color[=mode]    colorize the prompt label + default hint
+                     (always|auto|never; bare = always; default auto).
+                     ANSI codes in a values list are rendered in the
+                     picker and stripped from the output.
+
+  --trim            trim leading/trailing whitespace from answers (default on
+                    for non-secrets, off for secrets); --no-trim preserves it.
+                    C trim=0/trim=1 overrides per spec.
+  --validate <re>   POSIX ERE matched against every free-text answer (a mismatch
+                    is an error in scripted mode, a cancel in interactive).
+                    Values-list picks are exempt unless a per-spec qr: regex
+                    constrains them. --validate-error <msg> overrides the
+                    default 'invalid: does not match <pattern>' message.
+  --retry <n>       re-prompt up to N times on a required/validate failure
+                    (default 0 = fail fast). C retry=<n> overrides per spec.
+                    Scripted mode ignores --retry (no re-prompt loop) with a
+                    stderr notice.
+  --header <text>   a banner printed to stderr once before the first prompt
+                    (colored with the label color when --color is on). For fzf
+                    it is also passed as --header. --header-file <path> reads
+                    the banner from a file; the two are mutually exclusive.
+  --width <n>       tmux popup width in characters (default 80). --height <n>
+                    popup height in lines (default 20). --auto-size computes the
+                    dimensions from the specs (max prompt+default+value width,
+                    num inputs + padding), capped at the terminal. In-shell mode
+                    ignores these (no popup).
+  --json            emit JSON Lines (one {"name":..,"value":..} object per input)
+                    instead of name=value. --json-array emits a single JSON array.
+                    Values are JSON-escaped; secrets are cleartext.
+  --label-color <s> set the prompt-label color (named: "bold red", "cyan"; or raw
+                    SGR: "1;31"). --default-color <s> sets the default-hint color.
+                    --theme <name> bundles both: default, dark, light, high-contrast.
+                    C label-color=/default-color= keys override per spec.
+  --save <file>     write this run's name=value answers to <file> on success
+                    (atomic; secrets skipped unless --save-secrets). --load <file>
+                    pre-fills defaults from a prior answers file (missing file =
+                    silent no-op; precedence: answer > loaded > spec default).
+  --multiline       read a multi-line block until a sentinel line (default '.';
+                    --sentinel <s> sets it; --sentinel '' = EOF-terminated). C
+                    multiline=1/sentinel= per spec. Values-list inputs ignore it.
+  --timeout <n>     cancel the run after N seconds with no stdout (a background
+                    alarm + SIGALRM trap). Applies to in-shell + popup collect.
+  --history <file>  pre-fill each input's default with the last prior value for
+                    its name from <file>, and append this run's name=value answers
+                    on success (secrets skipped unless --save-secrets).
+debug:
+  --print-spec      normalize specs only, print tab-separated records, exit
+
+specs:
+  --specs-from <f>  read B specs from file <f> (one per line; # comments and
+                    blank lines ignored); mutually exclusive with B positionals
+  B (positional):   'name|prompt|default[|values]'   (repeatable)
+                    a leading '*' on the name marks a secret (hidden entry);
+                    a leading '!' marks a required field (empty = error).
+                    '*' and '!' combine ('*!' or '!*') and are stripped.
+                    a 'qr:'-prefixed field (any position) is a validate regex.
+  C (stdin):        key=value lines, blank-line separated:
+                      name=, prompt=, default=, values=,
+                      default-env=VAR, values-env=VAR,
+                      secret=1, multi=1, trim=0/1, required=1
+
+environment:
+  $VAR and ${VAR} are expanded in default/values/prompt fields.
+  NO_COLOR (set) disables color in auto mode.
+
+output:
+  one 'name=value' line per input, in order, on stdout.
+  cancel: exit non-zero, no stdout.
+EOF
+}
+
+tp_die() { echo "tprompt: $*" >&2; exit 1; }
+tp_have() { command -v "$1" >/dev/null 2>&1; }
+tp_is_tty_stdin() { [ -t 0 ]; }
+
+# expand $VAR/${VAR} on stdin -> stdout
+tp_expand() { awk "$TP_EXPAND_AWK"'{print tp_xpand($0)}'; }
+
+# strip ANSI CSI sequences from stdin -> stdout (SGR and other CSI)
+tp_strip_ansi() {
+    awk 'BEGIN{e=sprintf("%c",27)} {gsub(e "\\[[0-9;]*[A-Za-z]",""); print}'
+}
+
+# join stdin lines with separator $1 -> stdout (single line, trailing newline)
+tp_join() {
+    awk -v sep="$1" 'NR>1{printf "%s",sep}{printf "%s",$0}END{printf "\n"}'
+}
+
+# save the result file ($1, name=value lines) to $2 atomically, skipping secrets
+# unless TP_SAVE_SECRETS (cross-references TP_SPEC field 5 for the secret flag).
+# ret 0 ok / 1 hard error (caller exits non-zero, no stdout).
+tp_save() {
+    resf="$1"; savef="$2"
+    case "$savef" in */*) dir="${savef%/*}" ;; *) dir="." ;; esac
+    [ -d "$dir" ] && [ -w "$dir" ] || return 1
+    tmp=$(mktemp "${savef}.tpXXXXXX") || return 1
+    if [ "$TP_SAVE_SECRETS" = 1 ]; then
+        tr '\000' '\n' < "$resf" > "$tmp"
+    else
+        awk -F"$TP_SEP" '$5==1 {print $1}' "$TP_SPEC" > "$tmp.sec"
+        tr '\000' '\n' < "$resf" | awk -v sf="$tmp.sec" '
+            BEGIN { while((getline l < sf)>0) sec[l]=1; close(sf) }
+            { eq=index($0,"="); n=(eq>0?substr($0,1,eq-1):""); if (n in sec) { print "tprompt: not saving secret field "n > "/dev/stderr"; next } print }
+        ' > "$tmp"
+        rm -f "$tmp.sec"
+    fi
+    mv "$tmp" "$savef" || { rm -f "$tmp" "$tmp.sec"; return 1; }
+    return 0
+}
+
+# emit name=value lines (stdin) as JSON. $1 = "lines" (JSON Lines) or "array".
+# values are JSON-escaped (", \, and control chars \t \n \r \b \f).
+tp_json_emit() {
+    awk -v mode="$1" '
+        function esc(s,   r,i,n,c) {
+            r=""; n=length(s)
+            for (i=1; i<=n; i++) {
+                c=substr(s,i,1)
+                if (c=="\\") r=r "\\\\"
+                else if (c=="\"") r=r "\\\""
+                else if (c=="\t") r=r "\\t"
+                else if (c=="\n") r=r "\\n"
+                else if (c=="\r") r=r "\\r"
+                else if (c=="\b") r=r "\\b"
+                else if (c=="\f") r=r "\\f"
+                else r=r c
+            }
+            return r
+        }
+        BEGIN { RS="\000"; if (mode=="array") printf "["; first=1 }
+        {
+            eq=index($0,"=")
+            if (eq>0) { name=substr($0,1,eq-1); val=substr($0,eq+1) }
+            else { name=$0; val="" }
+            obj = "{\"name\":\"" esc(name) "\",\"value\":\"" esc(val) "\"}"
+            if (mode=="array") { if (!first) printf ","; first=0; printf "%s", obj }
+            else print obj
+        }
+        END { if (mode=="array") print "]" }
+    '
+}
+
+# single-quote a string for safe re-evaluation by sh -c (popup re-entry)
+tp_shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# resolve a color spec -> an ANSI SGR CSI (e.g. \033[1;31m); "" -> "".
+# spec: named ("bold red", "red", "bold") or raw SGR params ("1;31").
+tp_color_spec() {
+    spec="$1"
+    [ -z "$spec" ] && return
+    case "$spec" in *[a-zA-Z]*) ;; *) printf '\033[%sm' "$spec"; return ;; esac
+    params=""
+    for tok in $spec; do
+        case "$tok" in
+            bold) params="$params;1" ;; dim) params="$params;2" ;; underline) params="$params;4" ;;
+            black) params="$params;30" ;; red) params="$params;31" ;; green) params="$params;32" ;;
+            yellow) params="$params;33" ;; blue) params="$params;34" ;; magenta) params="$params;35" ;;
+            cyan) params="$params;36" ;; white) params="$params;37" ;;
+        esac
+    done
+    params="${params#;}"
+    [ -z "$params" ] && return
+    printf '\033[%sm' "$params"
+}
+
+# resolve color mode + label/default CSIs (from --label-color/--default-color/--theme).
+tp_color_resolve() {
+    case "$TP_COLOR_RESOLVED" in
+        always) TP_COLOR_ON=1 ;;
+        never)  TP_COLOR_ON=0 ;;
+        *) if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then TP_COLOR_ON=1; else TP_COLOR_ON=0; fi ;;
+    esac
+    TP_LABEL_CSI_G="$TP_C_NAME"; TP_DEFAULT_CSI_G="$TP_C_DEFAULT"
+    if [ -n "$TP_THEME" ]; then
+        case "$TP_THEME" in
+            default) ;;
+            dark) TP_LABEL_CSI_G=$(tp_color_spec "bold blue"); TP_DEFAULT_CSI_G=$(tp_color_spec "dim white") ;;
+            light) TP_LABEL_CSI_G=$(tp_color_spec "blue"); TP_DEFAULT_CSI_G=$(tp_color_spec "black") ;;
+            high-contrast) TP_LABEL_CSI_G=$(tp_color_spec "bold white"); TP_DEFAULT_CSI_G=$(tp_color_spec "bold white") ;;
+            *) tp_die "--theme must be default, dark, light, or high-contrast" ;;
+        esac
+    fi
+    [ -n "$TP_LABEL_COLOR" ] && TP_LABEL_CSI_G=$(tp_color_spec "$TP_LABEL_COLOR")
+    [ -n "$TP_DEFAULT_COLOR" ] && TP_DEFAULT_CSI_G=$(tp_color_spec "$TP_DEFAULT_COLOR")
+    TP_LABEL_CSI=$TP_LABEL_CSI_G; TP_DEFAULT_CSI=$TP_DEFAULT_CSI_G
+}
+tp_color_name() {
+    if [ "$TP_COLOR_ON" = 1 ]; then printf '%s%s%s' "$TP_LABEL_CSI" "$1" "$TP_C_RESET"
+    else printf '%s' "$1"; fi
+}
+tp_color_default() {
+    if [ "$TP_COLOR_ON" = 1 ]; then printf '%s%s%s' "$TP_DEFAULT_CSI" "$1" "$TP_C_RESET"
+    else printf '%s' "$1"; fi
+}
+
+# trim leading/trailing spaces and tabs from stdin -> stdout
+tp_trim_ws() { awk '{gsub(/^[ \t]+|[ \t]+$/, ""); print}'; }
+
+# resolve effective trim for a record: per-spec trim > global flag > default policy.
+# args: $1 = per-spec trim ("" | "1" | "0"), $2 = secret (0|1). echoes 1 (trim) or 0.
+tp_trim_resolve() {
+    case "$1" in 1) echo 1; return ;; 0) echo 0; return ;; esac
+    case "$TP_TRIM_GLOBAL" in 1) echo 1; return ;; 0) echo 0; return ;; esac
+    [ "$2" = 1 ] && { echo 0; return; }
+    echo 1
+}
+
+# parse a C spec on stdin -> spec records on stdout (TP_SEP-delimited, 6 fields)
+# fields: name, prompt, default, values, secret, multi
+#   secret: from a leading '*' on the name, or the `secret=` key
+#   multi:  from the `multi=` key, else the global --multi flag (MULTIG)
+tp_parse_c() {
+    awk -v SEP="$TP_SEP" -v MULTIG="$TP_MULTI" "$TP_EXPAND_AWK"'
+    BEGIN { n=p=d=v=""; rs=0; rm=""; rt=""; rr=0; rv=""; rve=""; rrt=""; rlc=""; rdc=""; rpv=""; ml=""; sen=""; rs_set=0; rr_set=0 }
+    function flush() {
+        if (n != "") {
+            while (substr(n,1,1) == "*" || substr(n,1,1) == "!") {
+                if (substr(n,1,1) == "*") { if (!rs_set) rs = 1 }
+                else { if (!rr_set) rr = 1 }
+                n = substr(n,2)
+            }
+            m = (rm != "" ? rm : MULTIG)
+            print n SEP tp_xpand(p) SEP tp_xpand(d) SEP tp_xpand(v) SEP (rs+0) SEP (m+0) SEP rt SEP (rr+0) SEP rv SEP rve SEP rrt SEP rlc SEP rdc SEP rpv SEP ml SEP sen
+        }
+        n=p=d=v=""; rs=0; rm=""; rt=""; rr=0; rv=""; rve=""; rrt=""; rlc=""; rdc=""; rpv=""; ml=""; sen=""; rs_set=0; rr_set=0
+    }
+    /^$/ { flush(); next }
+    {
+        eq=index($0,"=")
+        if (eq==0) { print "tprompt: malformed line (no =): "$0 > "/dev/stderr"; exit 2 }
+        k=substr($0,1,eq-1); val=substr($0,eq+1)
+        if (k=="name") n=val
+        else if (k=="prompt") p=val
+        else if (k=="default") d=val
+        else if (k=="values") v=val
+        else if (k=="default-env") { if (val in ENVIRON) d=ENVIRON[val] }
+        else if (k=="values-env") { if (val in ENVIRON) v=ENVIRON[val] }
+        else if (k=="secret") { rs=val; rs_set=1 }
+        else if (k=="multi") rm=val
+        else if (k=="trim") rt=val
+        else if (k=="required") { rr=val; rr_set=1 }
+        else if (k=="validate") rv=val
+        else if (k=="validate-error") rve=val
+        else if (k=="retry") rrt=val
+        else if (k=="label-color") rlc=val
+        else if (k=="default-color") rdc=val
+        else if (k=="preview") rpv=val
+        else if (k=="multiline") ml=val
+        else if (k=="sentinel") sen=val
+        else { print "tprompt: unknown key: "k > "/dev/stderr"; exit 2 }
+    }
+    END { flush() }
+    '
+}
+
+# numbered picker: $1=prompt, $2=values (newline-separated), $3=multi(0/1)
+# sets TP_VAL; ret 0/1 (1 = cancel).
+# single: read one index; out-of-range/non-numeric/empty/EOF => cancel.
+# multi:  read a comma-separated line; each token is an index (number in range)
+#         or a literal value; resolved values joined with TP_OUT_SEP.
+tp_pick_numbered() {
+    prompt="$1"; vals="$2"; multi="${3:-0}"
+    tf=$(mktemp /tmp/tpn.XXXXXX) || return 1
+    printf '%s\n' "$vals" > "$tf"
+    n=$(wc -l < "$tf" | tr -dc '0-9'); [ -z "$n" ] && n=0
+    awk '{printf "%d) %s\n", NR, $0}' "$tf" >&2
+    if [ "$multi" = 1 ]; then
+        printf '%s (comma-separated)> ' "$prompt" >&2
+        IFS= read -r line || { rm -f "$tf"; return 1; }
+        [ -z "$line" ] && { rm -f "$tf"; return 1; }
+        TP_VAL=$(awk -v line="$line" -v n="$n" -v sep="$TP_OUT_SEP" '
+            { idx[NR] = $0 }
+            END {
+                split(line, a, ",")
+                out = ""; cnt = 0
+                for (i = 1; i in a; i++) {
+                    t = a[i]
+                    gsub(/^[ \t]+|[ \t]+$/, "", t)
+                    if (t == "") continue
+                    if (t ~ /^[0-9]+$/ && t+0 >= 1 && t+0 <= n) v = idx[t+0]
+                    else v = t
+                    if (cnt == 0) out = v; else out = out sep v
+                    cnt++
+                }
+                print out
+            }
+        ' "$tf")
+        rm -f "$tf"
+        [ -n "$TP_VAL" ] && return 0 || return 1
+    fi
+    printf '%s> ' "$prompt" >&2
+    IFS= read -r idx || { rm -f "$tf"; return 1; }
+    case "$idx" in
+        ''|*[!0-9]*) rm -f "$tf"; return 1 ;;
+    esac
+    if [ "$n" -gt 0 ] && [ "$idx" -ge 1 ] && [ "$idx" -le "$n" ]; then
+        TP_VAL=$(sed -n "${idx}p" "$tf")
+        rm -f "$tf"; return 0
+    fi
+    rm -f "$tf"; return 1
+}
+
+# values picker: $1=prompt, $2=values (comma-separated), $3=multi(0/1)
+# sets TP_VAL (ANSI-stripped); ret 0/1.
+tp_pick_value() {
+    prompt="$1"; raw="$2"; multi="${3:-0}"
+    vals=$(printf '%s' "$raw" | tr ',' '\n')
+    case "$TP_PICKER_RESOLVED" in
+        fzf)
+            if tp_have fzf; then
+                mf=""
+                [ "$multi" = 1 ] && mf="--multi"
+                if [ -n "$TP_PREVIEW" ]; then
+                    sel=$(printf '%s\n' "$vals" | fzf $mf --ansi --prompt="$prompt> " --no-info --header="$TP_HEADER" --preview="$TP_PREVIEW" 2>/dev/null)
+                else
+                    sel=$(printf '%s\n' "$vals" | fzf $mf --ansi --prompt="$prompt> " --no-info --header="$TP_HEADER" 2>/dev/null)
+                fi
+                if [ "$multi" = 1 ]; then
+                    TP_VAL=$(printf '%s\n' "$sel" | tp_join "$TP_OUT_SEP")
+                else
+                    TP_VAL="$sel"
+                fi
+                if [ -n "$TP_VAL" ]; then
+                    TP_VAL=$(printf '%s' "$TP_VAL" | tp_strip_ansi)
+                    return 0
+                fi
+                return 1
+            else
+                tp_pick_numbered "$prompt" "$vals" "$multi" || return 1
+            fi
+            ;;
+        numbered)
+            tp_pick_numbered "$prompt" "$vals" "$multi" || return 1
+            ;;
+        *)
+            TP_VAL=$(printf '%s\n' "$vals" | { $TP_PICKER_RESOLVED; } 2>/dev/null | head -n1) || return 1
+            [ -n "$TP_VAL" ] || return 1
+            TP_VAL=$(printf '%s' "$TP_VAL" | tp_strip_ansi)
+            ;;
+    esac
+}
+
+# free-text read: $1=prompt, $2=default, $3=secret(0/1), $4=required(0/1); sets TP_VAL; ret 0/1 (1 = cancel)
+# secret: hide entry (stty -echo), do not show the default in the prompt.
+# required: an empty input is left empty (default NOT applied) so the required
+# check downstream flags it; the default is otherwise the empty-answer fallback.
+tp_read_value() {
+    prompt="$1"; default="$2"; secret="${3:-0}"; required="${4:-0}"
+    label=$(tp_color_name "$prompt")
+    if [ "$secret" = 1 ]; then
+        printf '%s: ' "$label" >&2
+        TP_VAL=""
+        if [ -t 0 ]; then
+            stty -echo 2>/dev/null
+            IFS= read -r TP_VAL
+            rc=$?
+            stty echo 2>/dev/null
+            printf '\n' >&2
+        else
+            IFS= read -r TP_VAL
+            rc=$?
+        fi
+        if [ "$rc" -ne 0 ] && [ -z "$TP_VAL" ]; then return 1; fi
+        if [ -z "$TP_VAL" ] && [ "$required" != 1 ]; then TP_VAL="$default"; fi
+        return 0
+    fi
+    if [ -n "$default" ]; then
+        dflt=$(tp_color_default "$default")
+        printf '%s [%s]: ' "$label" "$dflt" >&2
+    else
+        printf '%s: ' "$label" >&2
+    fi
+    TP_VAL=""
+    if IFS= read -r TP_VAL; then :
+    elif [ -n "$TP_VAL" ]; then :
+    else return 1; fi
+    if [ -z "$TP_VAL" ] && [ "$required" != 1 ]; then TP_VAL="$default"; fi
+    return 0
+}
+
+# check $val against required + validate (reads globals: name, required, val,
+# validate, validate_error, values, TP_VALIDATE, TP_VALIDATE_ERROR).
+# Sets TP_REASON ("" if valid). ret 0 = valid, 1 = invalid.
+tp_check_val() {
+    TP_REASON=""
+    if [ "$required" = 1 ] && [ -z "$val" ]; then
+        TP_REASON="required field '$name' is empty"; return 1
+    fi
+    eff_validate="$validate"
+    if [ -z "$eff_validate" ] && [ -n "$TP_VALIDATE" ]; then
+        if [ -z "$values" ] || [ "$values" = "-" ]; then eff_validate="$TP_VALIDATE"; fi
+    fi
+    if [ -n "$eff_validate" ] && [ -n "$val" ]; then
+        if ! printf '%s\n' "$val" | awk -v re="$eff_validate" '{exit ($0 ~ re ? 0 : 1)}' 2>/dev/null; then
+            TP_REASON="$validate_error"
+            [ -z "$TP_REASON" ] && TP_REASON="$TP_VALIDATE_ERROR"
+            [ -z "$TP_REASON" ] && TP_REASON="invalid: does not match $eff_validate"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# read a multi-line block from stdin until sentinel ($1, "" = EOF) or EOF.
+# sets TP_VAL (lines joined with real newlines; sentinel excluded). ret 0.
+tp_read_block() {
+    sentinel="$1"
+    block=""; first=1
+    while IFS= read -r ln || [ -n "$ln" ]; do
+        if [ -n "$sentinel" ] && [ "$ln" = "$sentinel" ]; then break; fi
+        if [ "$first" = 1 ]; then block="$ln"; first=0
+        else block="$block
+$ln"
+        fi
+    done
+    TP_VAL="$block"
+    return 0
+}
+
+# spawn $VISUAL/$EDITOR (or vi) on a temp file pre-filled with $1 (template);
+# read back, strip exactly one trailing newline. Sets TP_VAL. ret 0/1 (1 = unavailable).
+tp_edit() {
+    template="$1"
+    tmp=$(mktemp 2>/dev/null) || return 1
+    printf '%s' "$template" > "$tmp" 2>/dev/null
+    ed="${VISUAL:-${EDITOR:-vi}}"
+    command -v "$ed" >/dev/null 2>&1 || { rm -f "$tmp"; TP_VAL=""; return 1; }
+    "$ed" "$tmp" >/dev/null 2>&1
+    TP_VAL=$(cat "$tmp" 2>/dev/null; printf X)
+    TP_VAL="${TP_VAL%X}"
+    nl='
+'
+    case "$TP_VAL" in *"$nl") TP_VAL="${TP_VAL%"$nl"}" ;; esac
+    rm -f "$tmp"
+    return 0
+}
+
+# arm a --timeout alarm (background sleep + ALRM trap); no-op if TP_TIMEOUT <= 0.
+tp_alarm_arm() {
+    [ "${TP_TIMEOUT:-0}" -gt 0 ] 2>/dev/null || return 0
+    ( sleep "$TP_TIMEOUT" 2>/dev/null && kill -ALRM $$ 2>/dev/null ) &
+    TP_TIMEOUT_PID=$!
+    trap 'echo "tprompt: timed out after '"$TP_TIMEOUT"'s" >&2; exit 1' ALRM
+    trap 'kill "$TP_TIMEOUT_PID" 2>/dev/null' EXIT
+}
+
+# collect values for records in $1 (specfile) -> $2 (resfile, "" = stdout)
+# spec record fields: name, prompt, default, values, secret, multi, trim,
+#   required, validate, validate_error, retry
+tp_collect() {
+    specf="$1"; resf="$2"
+    [ -n "$resf" ] && : > "$resf"
+    rc=0
+    if [ "$TP_MODE" != interactive ] && [ "${TP_RETRY:-0}" -gt 0 ]; then
+        echo "tprompt: --retry has no effect in scripted mode" >&2
+    fi
+    if [ -n "$TP_HEADER" ]; then
+        printf '%s\n' "$(tp_color_name "$TP_HEADER")" >&2
+    fi
+    while IFS="$TP_SEP" read -r name prompt default values secret multi trim required validate validate_error retry label_color default_color preview multiline sentinel <&4 || [ -n "$name" ]; do
+        [ -z "$name" ] && continue
+        secret=${secret:-0}; multi=${multi:-0}; trim=${trim:-}; required=${required:-0}; validate=${validate:-}; validate_error=${validate_error:-}; retry=${retry:-}; label_color=${label_color:-}; default_color=${default_color:-}; preview=${preview:-}; multiline=${multiline:-}; sentinel=${sentinel:-}
+        TP_LABEL_CSI=$TP_LABEL_CSI_G; TP_DEFAULT_CSI=$TP_DEFAULT_CSI_G
+        [ -n "$label_color" ] && TP_LABEL_CSI=$(tp_color_spec "$label_color")
+        [ -n "$default_color" ] && TP_DEFAULT_CSI=$(tp_color_spec "$default_color")
+        TP_PREVIEW="$preview"
+        eff_ml="$multiline"; [ -z "$eff_ml" ] && eff_ml=$TP_MULTILINE
+        eff_sentinel="$sentinel"; [ -z "$eff_sentinel" ] && eff_sentinel="$TP_SENTINEL"
+        # editor mode: default starts with file: (template = the rest)
+        editor_mode=0; template=""
+        case "$default" in
+            file:*) editor_mode=1; template="${default#file:}" ;;
+        esac
+        if [ "$TP_MODE" = interactive ]; then
+            if [ -n "$values" ] && [ "$values" != "-" ]; then
+                # values-list pick: one-shot (no retry loop)
+                if tp_pick_value "$prompt" "$values" "$multi"; then val="$TP_VAL"; else rc=1; break; fi
+                if [ "$(tp_trim_resolve "$trim" "$secret")" = 1 ]; then val=$(printf '%s' "$val" | tp_trim_ws); fi
+                if ! tp_check_val; then printf '%s\n' "$TP_REASON" >&2; rc=1; break; fi
+            elif [ "$editor_mode" = 1 ]; then
+                # editor input: open $VISUAL/$EDITOR/vi on a temp file pre-filled with template
+                if ! tp_edit "$template"; then
+                    echo "tprompt: editor unavailable (set \$EDITOR or install vi)" >&2
+                    rc=1; break
+                fi
+                val="$TP_VAL"
+                if [ "$(tp_trim_resolve "$trim" "$secret")" = 1 ]; then val=$(printf '%s' "$val" | tp_trim_ws); fi
+                if ! tp_check_val; then printf '%s\n' "$TP_REASON" >&2; rc=1; break; fi
+            elif [ "$eff_ml" = 1 ]; then
+                # multi-line block (no retry loop)
+                if [ -n "$eff_sentinel" ]; then
+                    printf '%s (end with %s):\n' "$(tp_color_name "$prompt")" "$eff_sentinel" >&2
+                else
+                    printf '%s (end with Ctrl-D):\n' "$(tp_color_name "$prompt")" >&2
+                fi
+                tp_read_block "$eff_sentinel"; val="$TP_VAL"
+                [ -z "$val" ] && val="$default"
+                if [ "$(tp_trim_resolve "$trim" "$secret")" = 1 ]; then val=$(printf '%s' "$val" | tp_trim_ws); fi
+                if ! tp_check_val; then printf '%s\n' "$TP_REASON" >&2; rc=1; break; fi
+            else
+                # free-text interactive: retry loop on required/validate failure
+                rmax="${retry:-$TP_RETRY}"; [ -z "$rmax" ] && rmax=0
+                attempts=0; cancel=
+                while :; do
+                    if ! tp_read_value "$prompt" "$default" "$secret" "$required"; then cancel=1; break; fi
+                    val="$TP_VAL"
+                    if [ "$(tp_trim_resolve "$trim" "$secret")" = 1 ]; then val=$(printf '%s' "$val" | tp_trim_ws); fi
+                    if tp_check_val; then break; fi
+                    if [ "$attempts" -lt "$rmax" ]; then
+                        attempts=$((attempts + 1))
+                        printf '%s; try again (%d left)\n' "$TP_REASON" "$((rmax - attempts))" >&2
+                        continue
+                    fi
+                    cancel=1; break
+                done
+                if [ -n "$cancel" ]; then rc=1; break; fi
+            fi
+        elif [ "$TP_SOURCE" = C ]; then
+            if [ "$editor_mode" = 1 ]; then val="$template"
+            elif [ -n "$default" ]; then val="$default"
+            else
+                if [ -n "$resf" ]; then printf 'TPROMPT_ERROR:no value for %s (C spec, no default)\000' "$name" >> "$resf"
+                else echo "tprompt: no value for '$name' (C spec, no default)" >&2; fi
+                rc=2; break
+            fi
+            if [ "$(tp_trim_resolve "$trim" "$secret")" = 1 ]; then val=$(printf '%s' "$val" | tp_trim_ws); fi
+            if ! tp_check_val; then
+                if [ -n "$resf" ]; then printf 'TPROMPT_ERROR:%s\000' "$TP_REASON" >> "$resf"
+                else echo "tprompt: $TP_REASON" >&2; fi
+                rc=2; break
+            fi
+        else
+            # B scripted: read one answer line (or a multi-line block); default on empty
+            if [ "$editor_mode" = 1 ]; then
+                val="$template"
+            elif [ "$eff_ml" = 1 ]; then
+                tp_read_block "$eff_sentinel"; val="$TP_VAL"
+                [ -z "$val" ] && val="$default"
+            else
+                line=""
+                IFS= read -r line
+                if [ "$required" != 1 ] && [ -z "$line" ]; then line="$default"; fi
+                val="$line"
+            fi
+            if [ "$(tp_trim_resolve "$trim" "$secret")" = 1 ]; then val=$(printf '%s' "$val" | tp_trim_ws); fi
+            if ! tp_check_val; then
+                if [ -n "$resf" ]; then printf 'TPROMPT_ERROR:%s\000' "$TP_REASON" >> "$resf"
+                else echo "tprompt: $TP_REASON" >&2; fi
+                rc=2; break
+            fi
+            if [ -z "$val" ]; then
+                if [ -n "$resf" ]; then printf 'TPROMPT_ERROR:no value for %s (no answer, no default)\000' "$name" >> "$resf"
+                else echo "tprompt: no value for '$name' (no answer, no default)" >&2; fi
+                rc=2; break
+            fi
+        fi
+        # always strip ANSI from the emitted value (no-op for plain text)
+        val=$(printf '%s' "$val" | tp_strip_ansi)
+        if [ -n "$resf" ]; then printf '%s=%s\000' "$name" "$val" >> "$resf"
+        else printf '%s=%s\000' "$name" "$val"; fi
+    done 4< "$specf"
+    return $rc
+}
+
+# resolve absolute path to this script (for tmux popup re-entry)
+tp_self_path() {
+    if cand=$(command -v "$0" 2>/dev/null); then
+        case "$cand" in /*) echo "$cand"; return ;; esac
+    fi
+    case "$0" in /*) echo "$0" ;; *) echo "$(pwd)/$0" ;; esac
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+TP_TMP=""
+tp_mktmp() { f=$(mktemp /tmp/tp.XXXXXX) || tp_die "mktemp failed"; TP_TMP="$TP_TMP $f"; echo "$f"; }
+trap 'stty echo 2>/dev/null; rm -f $TP_TMP' EXIT
+trap 'stty echo 2>/dev/null; rm -f $TP_TMP; exit 130' INT TERM HUP
+
+TP_RENDER=""; TP_PICKER=""; TP_NO_TMUX=0; TP_NO_FZF=0
+TP_MODE_OVERRIDE=""; TP_PRINT_SPEC=0
+TP_INTERNAL=0; TP_SPEC_IN=""; TP_RES_IN=""; TP_SPECS_FROM=""
+TP_COLOR_RESOLVED=""; TP_COLOR_ON=0; TP_MULTI=0; TP_OUT_SEP=","; TP_TRIM_GLOBAL=""; TP_VALIDATE=""; TP_VALIDATE_ERROR=""; TP_RETRY=0; TP_HEADER=""; TP_HEADER_FILE=""; TP_WIDTH=80; TP_HEIGHT=20; TP_AUTOSIZE=0; TP_JSON=0; TP_JSON_ARRAY=0; TP_LABEL_COLOR=""; TP_DEFAULT_COLOR=""; TP_THEME=""; TP_SAVE=""; TP_LOAD=""; TP_SAVE_SECRETS=0; TP_MULTILINE=0; TP_SENTINEL="."; TP_TIMEOUT=0; TP_HISTORY=""
+TP_BSPECS=$(tp_mktmp); : > "$TP_BSPECS"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --in-shell)  TP_RENDER=in-shell ;;
+        --new-shell) TP_RENDER=new-shell ;;
+        --popup)     TP_RENDER=popup ;;
+        --no-tmux)   TP_NO_TMUX=1 ;;
+        --no-fzf)    TP_NO_FZF=1 ;;
+        --interactive) TP_MODE_OVERRIDE=interactive ;;
+        --scripted)    TP_MODE_OVERRIDE=scripted ;;
+        --picker) [ $# -ge 2 ] || tp_die "--picker needs an argument"; TP_PICKER="$2"; shift ;;
+        --picker=*) TP_PICKER="${1#--picker=}" ;;
+        --color) TP_COLOR_RESOLVED=always ;;
+        --color=*) TP_COLOR_RESOLVED="${1#--color=}"; case "$TP_COLOR_RESOLVED" in always|auto|never) ;; *) tp_die "--color mode must be always, auto, or never";; esac ;;
+        --multi) TP_MULTI=1 ;;
+        --trim) TP_TRIM_GLOBAL=1 ;;
+        --no-trim) TP_TRIM_GLOBAL=0 ;;
+        --sep) [ $# -ge 2 ] || tp_die "--sep needs an argument"; TP_OUT_SEP="$2"; shift ;;
+        --sep=*) TP_OUT_SEP="${1#--sep=}" ;;
+        --separator) [ $# -ge 2 ] || tp_die "--separator needs an argument"; TP_OUT_SEP="$2"; shift ;;
+        --separator=*) TP_OUT_SEP="${1#--separator=}" ;;
+        --print-spec) TP_PRINT_SPEC=1 ;;
+        --specs-from) [ $# -ge 2 ] || tp_die "--specs-from needs an argument"; TP_SPECS_FROM="$2"; shift ;;
+        --specs-from=*) TP_SPECS_FROM="${1#--specs-from=}"; [ -n "$TP_SPECS_FROM" ] || tp_die "--specs-from needs an argument" ;;
+        --validate) [ $# -ge 2 ] || tp_die "--validate needs an argument"; TP_VALIDATE="$2"; shift ;;
+        --validate=*) TP_VALIDATE="${1#--validate=}" ;;
+        --validate-error) [ $# -ge 2 ] || tp_die "--validate-error needs an argument"; TP_VALIDATE_ERROR="$2"; shift ;;
+        --validate-error=*) TP_VALIDATE_ERROR="${1#--validate-error=}" ;;
+        --retry) [ $# -ge 2 ] || tp_die "--retry needs an argument"; TP_RETRY="$2"; case "$TP_RETRY" in ''|*[!0-9]*) tp_die "--retry must be a non-negative integer";; esac; shift ;;
+        --retry=*) TP_RETRY="${1#--retry=}"; case "$TP_RETRY" in ''|*[!0-9]*) tp_die "--retry must be a non-negative integer";; esac ;;
+        --header) [ $# -ge 2 ] || tp_die "--header needs an argument"; TP_HEADER="$2"; shift ;;
+        --header=*) TP_HEADER="${1#--header=}" ;;
+        --header-file) [ $# -ge 2 ] || tp_die "--header-file needs an argument"; TP_HEADER_FILE="$2"; shift ;;
+        --header-file=*) TP_HEADER_FILE="${1#--header-file=}" ;;
+        --width) [ $# -ge 2 ] || tp_die "--width needs an argument"; TP_WIDTH="$2"; case "$TP_WIDTH" in ''|*[!0-9]*) tp_die "--width must be a positive integer";; esac; shift ;;
+        --width=*) TP_WIDTH="${1#--width=}"; case "$TP_WIDTH" in ''|*[!0-9]*) tp_die "--width must be a positive integer";; esac ;;
+        --height) [ $# -ge 2 ] || tp_die "--height needs an argument"; TP_HEIGHT="$2"; case "$TP_HEIGHT" in ''|*[!0-9]*) tp_die "--height must be a positive integer";; esac; shift ;;
+        --height=*) TP_HEIGHT="${1#--height=}"; case "$TP_HEIGHT" in ''|*[!0-9]*) tp_die "--height must be a positive integer";; esac ;;
+        --auto-size) TP_AUTOSIZE=1 ;;
+        --json) TP_JSON=1 ;;
+        --json-array) TP_JSON=1; TP_JSON_ARRAY=1 ;;
+        --label-color) [ $# -ge 2 ] || tp_die "--label-color needs an argument"; TP_LABEL_COLOR="$2"; shift ;;
+        --label-color=*) TP_LABEL_COLOR="${1#--label-color=}" ;;
+        --default-color) [ $# -ge 2 ] || tp_die "--default-color needs an argument"; TP_DEFAULT_COLOR="$2"; shift ;;
+        --default-color=*) TP_DEFAULT_COLOR="${1#--default-color=}" ;;
+        --theme) [ $# -ge 2 ] || tp_die "--theme needs an argument"; TP_THEME="$2"; shift ;;
+        --theme=*) TP_THEME="${1#--theme=}" ;;
+        --save) [ $# -ge 2 ] || tp_die "--save needs an argument"; TP_SAVE="$2"; shift ;;
+        --save=*) TP_SAVE="${1#--save=}" ;;
+        --load) [ $# -ge 2 ] || tp_die "--load needs an argument"; TP_LOAD="$2"; shift ;;
+        --load=*) TP_LOAD="${1#--load=}" ;;
+        --save-secrets) TP_SAVE_SECRETS=1 ;;
+        --multiline) TP_MULTILINE=1 ;;
+        --sentinel) [ $# -ge 2 ] || tp_die "--sentinel needs an argument"; TP_SENTINEL="$2"; shift ;;
+        --sentinel=*) TP_SENTINEL="${1#--sentinel=}" ;;
+        --timeout) [ $# -ge 2 ] || tp_die "--timeout needs an argument"; TP_TIMEOUT="$2"; case "$TP_TIMEOUT" in ''|*[!0-9]*) tp_die "--timeout must be a positive integer";; esac; shift ;;
+        --timeout=*) TP_TIMEOUT="${1#--timeout=}"; case "$TP_TIMEOUT" in ''|*[!0-9]*) tp_die "--timeout must be a positive integer";; esac ;;
+        --history) [ $# -ge 2 ] || tp_die "--history needs an argument"; TP_HISTORY="$2"; shift ;;
+        --history=*) TP_HISTORY="${1#--history=}" ;;
+        -h|--help) tp_usage; exit 0 ;;
+        -V|--version) echo "tprompt $TPROMPT_VERSION"; exit 0 ;;
+        --internal-collect)
+            TP_INTERNAL=1; shift
+            [ $# -ge 1 ] || tp_die "--internal-collect needs <specfile>"; TP_SPEC_IN="$1"; shift
+            [ $# -ge 1 ] || tp_die "--internal-collect needs <resfile>"; TP_RES_IN="$1"; shift
+            break ;;
+        --) shift; while [ $# -gt 0 ]; do printf '%s\n' "$1" >> "$TP_BSPECS"; shift; done; break ;;
+        --*) tp_die "unknown option: $1" ;;
+        -*)  tp_die "unknown option: $1" ;;
+        *) printf '%s\n' "$1" >> "$TP_BSPECS" ;;
+    esac
+    shift
+done
+
+# internal-collect: invoked inside a tmux popup (or directly for testing)
+if [ "$TP_INTERNAL" = 1 ]; then
+    if [ -n "$TP_MODE_OVERRIDE" ]; then TP_MODE=$TP_MODE_OVERRIDE
+    elif tp_is_tty_stdin; then TP_MODE=interactive; else TP_MODE=scripted; TP_SOURCE=B; fi
+    if [ -z "${TP_PICKER_RESOLVED:-}" ]; then
+        if [ "$TP_NO_FZF" = 0 ] && tp_have fzf; then TP_PICKER_RESOLVED=fzf; else TP_PICKER_RESOLVED=numbered; fi
+    fi
+    tp_color_resolve
+    tp_alarm_arm
+    tp_collect "$TP_SPEC_IN" "$TP_RES_IN"
+    exit $?
+fi
+
+# --- --specs-from: read B specs from a file (mutually exclusive with positionals) ---
+if [ -n "$TP_SPECS_FROM" ]; then
+    if [ -s "$TP_BSPECS" ]; then
+        tp_die "--specs-from cannot be combined with positional specs"
+    fi
+    [ -f "$TP_SPECS_FROM" ] || tp_die "--specs-from: file not found: $TP_SPECS_FROM"
+    [ -r "$TP_SPECS_FROM" ] || tp_die "--specs-from: file not readable: $TP_SPECS_FROM"
+    while IFS= read -r sfl || [ -n "$sfl" ]; do
+        case "$sfl" in ''|\#*) continue ;; esac
+        printf '%s\n' "$sfl" >> "$TP_BSPECS"
+    done < "$TP_SPECS_FROM"
+    [ -s "$TP_BSPECS" ] || tp_die "--specs-from: no specs in $TP_SPECS_FROM"
+fi
+
+# --- --header / --header-file ---
+if [ -n "$TP_HEADER_FILE" ]; then
+    [ -n "$TP_HEADER" ] && tp_die "--header and --header-file are mutually exclusive"
+    [ -f "$TP_HEADER_FILE" ] || tp_die "--header-file: file not found: $TP_HEADER_FILE"
+    [ -r "$TP_HEADER_FILE" ] || tp_die "--header-file: file not readable: $TP_HEADER_FILE"
+    TP_HEADER=$(cat "$TP_HEADER_FILE")
+fi
+
+# --- --json / --save are mutually exclusive ---
+if [ "$TP_JSON" = 1 ] && [ -n "$TP_SAVE" ]; then
+    tp_die "--json and --save are mutually exclusive"
+fi
+
+# --- mode + source ---
+if [ -n "$TP_MODE_OVERRIDE" ]; then TP_MODE=$TP_MODE_OVERRIDE
+elif tp_is_tty_stdin; then TP_MODE=interactive; else TP_MODE=scripted; fi
+if [ -s "$TP_BSPECS" ]; then TP_SOURCE=B; else TP_SOURCE=C; fi
+if [ "$TP_SOURCE" = C ] && [ "$TP_MODE" = interactive ]; then
+    tp_die "no B specs; a C spec is read from stdin and is scripted (drop --interactive, or pass B positionals)"
+fi
+
+# --- normalize specs -> TP_SPEC (6 TP_SEP-delimited fields) ---
+TP_SPEC=$(tp_mktmp); : > "$TP_SPEC"
+if [ "$TP_SOURCE" = B ]; then
+    while IFS= read -r spec <&4 || [ -n "$spec" ]; do
+        [ -z "$spec" ] && continue
+        printf '%s' "$spec" | awk -v SEP="$TP_SEP" -v MULTIG="$TP_MULTI" "$TP_EXPAND_AWK"'
+            {
+                nf = split($0, f, /[|]/)
+                name=""; prompt=""; def=""; vals=""; validate=""; preview=""
+                pos = 0
+                for (i = 1; i <= nf; i++) {
+                    if (substr(f[i],1,3) == "qr:") validate = substr(f[i],4)
+                    else if (substr(f[i],1,3) == "pv:") preview = substr(f[i],4)
+                    else {
+                        pos++
+                        if      (pos==1) name   = f[i]
+                        else if (pos==2) prompt = f[i]
+                        else if (pos==3) def    = f[i]
+                        else if (pos==4) vals   = f[i]
+                    }
+                }
+                secret=0; required=0
+                while (substr(name,1,1)=="*" || substr(name,1,1)=="!") {
+                    if (substr(name,1,1)=="*") secret=1; else required=1
+                    name = substr(name,2)
+                }
+                print name SEP tp_xpand(prompt) SEP tp_xpand(def) SEP tp_xpand(vals) SEP secret SEP MULTIG SEP "" SEP required SEP validate SEP "" SEP "" SEP "" SEP "" SEP preview SEP "" SEP ""
+            }
+        '
+    done 4< "$TP_BSPECS" >> "$TP_SPEC"
+else
+    tp_parse_c >> "$TP_SPEC" || tp_die "malformed C spec"
+fi
+
+# --- --load: pre-fill defaults from a prior answers file (missing file = no-op) ---
+if [ -n "$TP_LOAD" ] && [ -f "$TP_LOAD" ] && [ -r "$TP_LOAD" ]; then
+    _new=$(tp_mktmp)
+    awk -F"$TP_SEP" -v OFS="$TP_SEP" '
+        NR==FNR { if ($0 ~ /^#/ || $0 == "") next; eq=index($0,"="); if (eq>0) lv[substr($0,1,eq-1)] = substr($0,eq+1); next }
+        { if ($1 in lv) $3 = lv[$1]; print }
+    ' "$TP_LOAD" "$TP_SPEC" > "$_new"
+    mv "$_new" "$TP_SPEC"
+fi
+
+# --- --history: pre-fill defaults with the last prior value per name ---
+if [ -n "$TP_HISTORY" ] && [ -f "$TP_HISTORY" ] && [ -r "$TP_HISTORY" ]; then
+    _new=$(tp_mktmp)
+    awk -F"$TP_SEP" -v OFS="$TP_SEP" '
+        NR==FNR { if ($0 ~ /^#/ || $0 == "") next; eq=index($0,"="); if (eq>0) lv[substr($0,1,eq-1)] = substr($0,eq+1); next }
+        { if ($1 in lv) $3 = lv[$1]; print }
+    ' "$TP_HISTORY" "$TP_SPEC" > "$_new"
+    mv "$_new" "$TP_SPEC"
+fi
+
+[ -s "$TP_SPEC" ] || tp_die "no input specs to prompt for"
+
+# --- print-spec debug: dump normalized records (6 readable tab-separated cols), exit ---
+if [ "$TP_PRINT_SPEC" = 1 ]; then
+    awk -F"$TP_SEP" '{printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16}' "$TP_SPEC"
+    exit 0
+fi
+
+# --- resolve picker ---
+if [ -z "$TP_PICKER" ]; then
+    if [ "$TP_NO_FZF" = 0 ] && tp_have fzf; then TP_PICKER_RESOLVED=fzf; else TP_PICKER_RESOLVED=numbered; fi
+else
+    TP_PICKER_RESOLVED="$TP_PICKER"
+fi
+
+# --- resolve color ---
+tp_color_resolve
+
+# --- resolve render ---
+if [ -z "$TP_RENDER" ]; then
+    if [ "$TP_NO_TMUX" = 0 ] && [ -n "${TMUX:-}" ] && tp_have tmux; then TP_RENDER=popup; else TP_RENDER=in-shell; fi
+elif [ "$TP_RENDER" = new-shell ]; then
+    if [ "$TP_NO_TMUX" = 0 ] && [ -n "${TMUX:-}" ] && tp_have tmux; then TP_RENDER=popup; else TP_RENDER=in-shell; fi
+elif [ "$TP_RENDER" = popup ]; then
+    if [ "$TP_NO_TMUX" = 1 ]; then
+        TP_RENDER=in-shell   # user opted out of tmux; silent fallback
+    elif [ -z "${TMUX:-}" ] || ! tp_have tmux; then
+        echo "tprompt: tmux unavailable; falling back to --in-shell" >&2
+        TP_RENDER=in-shell
+    fi
+fi
+
+# --- collect into TP_RES, then interpret (so cancel/error emit no stdout) ---
+TP_RES=$(tp_mktmp); : > "$TP_RES"
+if [ "$TP_RENDER" = popup ]; then
+    TP_SELF=$(tp_self_path)
+    color_arg=""
+    [ -n "$TP_COLOR_RESOLVED" ] && color_arg="--color=$TP_COLOR_RESOLVED"
+    label_color_arg=""
+    [ -n "$TP_LABEL_COLOR" ] && label_color_arg="--label-color $(tp_shell_quote "$TP_LABEL_COLOR")"
+    default_color_arg=""
+    [ -n "$TP_DEFAULT_COLOR" ] && default_color_arg="--default-color $(tp_shell_quote "$TP_DEFAULT_COLOR")"
+    theme_arg=""
+    [ -n "$TP_THEME" ] && theme_arg="--theme $(tp_shell_quote "$TP_THEME")"
+    sep_arg="--sep $(tp_shell_quote "$TP_OUT_SEP")"
+    trim_arg=""
+    [ "$TP_TRIM_GLOBAL" = 1 ] && trim_arg="--trim"
+    [ "$TP_TRIM_GLOBAL" = 0 ] && trim_arg="--no-trim"
+    validate_arg=""
+    [ -n "$TP_VALIDATE" ] && validate_arg="--validate $(tp_shell_quote "$TP_VALIDATE")"
+    validate_err_arg=""
+    [ -n "$TP_VALIDATE_ERROR" ] && validate_err_arg="--validate-error $(tp_shell_quote "$TP_VALIDATE_ERROR")"
+    retry_arg=""
+    [ "${TP_RETRY:-0}" -gt 0 ] && retry_arg="--retry $TP_RETRY"
+    header_arg=""
+    [ -n "$TP_HEADER" ] && header_arg="--header $(tp_shell_quote "$TP_HEADER")"
+    ml_arg=""
+    [ "$TP_MULTILINE" = 1 ] && ml_arg="--multiline"
+    sentinel_arg=""
+    if [ -n "$TP_SENTINEL" ] && [ "$TP_SENTINEL" != "." ]; then sentinel_arg="--sentinel $(tp_shell_quote "$TP_SENTINEL")"; fi
+    timeout_arg=""
+    [ "${TP_TIMEOUT:-0}" -gt 0 ] && timeout_arg="--timeout $TP_TIMEOUT"
+    if [ "$TP_AUTOSIZE" = 1 ]; then
+        tw=80; th=24
+        if tp_have tput; then tw=$(tput cols 2>/dev/null || echo 80); th=$(tput lines 2>/dev/null || echo 24); fi
+        dims=$(awk -F"$TP_SEP" '{ p=length($2); d=length($3); mv=0; n=split($4,va,","); for(i=1;i<=n;i++) if(length(va[i])>mv) mv=length(va[i]); w=p+d+mv+10; if(w>maxw)maxw=w; cnt++ } END { if(maxw==0)maxw=40; print maxw, cnt+6 }' "$TP_SPEC")
+        aw=$(printf '%s' "$dims" | awk '{print $1}')
+        ah=$(printf '%s' "$dims" | awk '{print $2}')
+        [ "$aw" -gt "$tw" ] 2>/dev/null && aw=$tw
+        [ "$ah" -gt "$th" ] 2>/dev/null && ah=$th
+        TP_WIDTH=$aw; TP_HEIGHT=$ah
+    fi
+    tmux display-popup -E -w "$TP_WIDTH" -h "$TP_HEIGHT" \
+        "$TP_SELF --picker $TP_PICKER_RESOLVED $sep_arg $color_arg $label_color_arg $default_color_arg $theme_arg $trim_arg $validate_arg $validate_err_arg $retry_arg $header_arg $ml_arg $sentinel_arg $timeout_arg --internal-collect $TP_SPEC $TP_RES" 2>/dev/null
+else
+    tp_alarm_arm
+    tp_collect "$TP_SPEC" "$TP_RES"
+fi
+
+# --- interpret result file ---
+N=$(grep -c . "$TP_SPEC" 2>/dev/null); [ -z "$N" ] && N=0
+if m=$(awk 'BEGIN{RS="\000"} /^TPROMPT_ERROR:/{print; exit}' "$TP_RES" 2>/dev/null) && [ -n "$m" ]; then
+    echo "tprompt: ${m#TPROMPT_ERROR:}" >&2
+    exit 1
+elif [ "$(tr -cd '\000' < "$TP_RES" 2>/dev/null | wc -c | tr -dc '0-9')" -eq "$N" ] && [ "$N" -gt 0 ]; then
+    if [ -n "$TP_SAVE" ]; then
+        if ! tp_save "$TP_RES" "$TP_SAVE"; then
+            echo "tprompt: cannot write save file '$TP_SAVE'" >&2
+            exit 1
+        fi
+    fi
+    if [ -n "$TP_HISTORY" ]; then
+        _hs=$(mktemp 2>/dev/null) || _hs=""
+        if [ -n "$_hs" ]; then
+            if [ "$TP_SAVE_SECRETS" = 1 ]; then
+                tr '\000' '\n' < "$TP_RES" >> "$TP_HISTORY" 2>/dev/null
+            else
+                awk -F"$TP_SEP" '$5==1 {print $1}' "$TP_SPEC" > "$_hs.sec"
+                tr '\000' '\n' < "$TP_RES" | awk -v sf="$_hs.sec" '
+                    BEGIN { while((getline l < sf)>0) sec[l]=1; close(sf) }
+                    { eq=index($0,"="); n=(eq>0?substr($0,1,eq-1):""); if (n in sec) next; print }
+                ' >> "$TP_HISTORY" 2>/dev/null
+                rm -f "$_hs.sec"
+            fi
+            rm -f "$_hs"
+        fi
+    fi
+    if [ "$TP_JSON" = 1 ]; then
+        if [ "$TP_JSON_ARRAY" = 1 ]; then tp_json_emit array < "$TP_RES"
+        else tp_json_emit lines < "$TP_RES"; fi
+    else
+        tr '\000' '\n' < "$TP_RES"
+    fi
+    exit 0
+else
+    exit 1   # cancel (partial or empty)
+fi

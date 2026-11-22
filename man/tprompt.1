@@ -1,0 +1,426 @@
+.Dd November 21, 2026
+.Dt TPROMPT 1
+.Os tprompt 0.2.0
+.Sh NAME
+.Nm tprompt
+.Nd prompt for named inputs, print name=value lines
+.Sh SYNOPSIS
+.Nm
+.Op Fl h | Fl V
+.Op Fl -in-shell | Fl -new-shell | Fl -popup
+.Op Fl -interactive | Fl -scripted
+.Op Fl -picker Ar fzf Ns | Ns Ar numbered Ns | Ns Ar cmd
+.Op Fl -no-tmux
+.Op Fl -no-fzf
+.Op Fl -color Op Li = Ns Ar always Ns | Ns Ar auto Ns | Ns Ar never
+.Op Fl -multi
+.Op Fl -sep Ar char
+.Op Fl -trim | Fl -no-trim
+.Op Fl -validate Ar regex
+.Op Fl -retry Ar n
+.Op Fl -header Ar text
+.Op Fl -width Ar n
+.Op Fl -height Ar n
+.Op Fl -auto-size
+.Op Fl -json
+.Op Fl -json-array
+.Op Fl -label-color Ar spec
+.Op Fl -default-color Ar spec
+.Op Fl -theme Ar name
+.Op Fl -save Ar file
+.Op Fl -load Ar file
+.Op Fl -multiline
+.Op Fl -sentinel Ar s
+.Op Fl -timeout Ar n
+.Op Fl -history Ar file
+.Op Fl -print-spec
+.Op Fl -specs-from Ar file
+.Op Ar spec ...
+.Sh DESCRIPTION
+.Nm
+collects one or more named inputs from the user and prints one
+.Sq Li name=value
+line per input, in order, to stdout.
+It is standalone (no
+.Xr tum 1
+dependency), tmux-optional, and fzf-optional.
+.Pp
+Inputs are described in one of two forms:
+.Bl -tag -width "B (positional)"
+.It B (positional)
+Each argument is
+.Ql name|prompt|default[|values] .
+Repeatable for multiple inputs.
+A leading
+.Ql *
+on the name marks a secret (hidden entry); a leading
+.Ql !
+marks a required field (an empty answer is an error).
+The prefixes combine
+.Pq Ql *! Ns or Ql !*
+and are stripped from the output key.
+A
+.Ql qr:
+prefixed field at any position is a validation regex (see
+.Sx VALIDATION );
+a
+.Ql pv:
+prefixed field at any position is a preview command (see
+.Sx PREVIEW );
+a
+.Ql file:
+prefixed default opens an editor.
+.It C (stdin)
+When no B positionals are given and stdin is not a tty, a spec is read from
+stdin as
+.Ql key=value
+lines, with a blank line separating inputs.
+Recognized keys:
+.Li name ,
+.Li prompt ,
+.Li default ,
+.Li values ,
+.Li default-env ,
+.Li values-env ,
+.Li secret ,
+.Li multi ,
+.Li trim ,
+.Li required ,
+.Li validate ,
+.Li validate-error ,
+.Li label-color ,
+.Li default-color ,
+.Li preview .
+.El
+.Pp
+In
+.Ar values ,
+a comma-separated list turns the input into a pick (fzf or numbered).
+With
+.Fl -multi
+(or C
+.Li multi=1 )
+the user may select several; selected values are joined with
+.Fl -sep
+(default
+.Ql , ) .
+.Sq Ev $VAR
+and
+.Sq Ev ${VAR}
+are expanded in
+.Li default ,
+.Li values ,
+and
+.Li prompt
+from the environment.
+.Sh SECRET INPUT
+A leading
+.Ql *
+on the name marks the input as secret.
+Entry is hidden
+.Pq Ic stty -echo ,
+the default is not shown in the prompt (it would leak it), and the
+.Ql *
+is stripped so the output key is the bare name.
+If the user enters an empty line, the default is used silently.
+The output is still cleartext
+.Pq Li pw=s3cr3t :
+.Nm
+hides
+.Em entry ,
+not the captured value.
+In C, use
+.Li name=*pw
+or the
+.Li secret=1
+key.
+.Sh OPTIONS
+.Bl -tag -width "-picker fzf|numbered|cmd"
+.It Fl h , Fl -help
+Show usage and exit.
+.It Fl V , Fl -version
+Print version and exit.
+.It Fl -in-shell
+Prompt in the current shell (default without tmux).
+.It Fl -new-shell
+Prompt in a fresh shell; uses a tmux popup if available, else in-shell.
+.It Fl -popup
+Prompt in a tmux
+.Ic display-popup .
+Requires being inside tmux; otherwise degrades to
+.Fl -in-shell
+with a stderr notice.
+.It Fl -no-tmux
+Never use tmux (popup/new-shell degrade to in-shell silently).
+.It Fl -interactive
+Force prompting (default when stdin is a tty).
+.It Fl -scripted
+Force non-interactive (default when stdin is a pipe).
+.It Fl -picker Ar fzf | numbered | Ar cmd
+Picker for values-list inputs.
+.Li fzf
+(the default when installed),
+.Li numbered ,
+or an external command that reads a newline-list on stdin and prints the
+choice on stdout.
+.It Fl -no-fzf
+Never use fzf; force numbered.
+.It Fl -multi
+Allow multiple values per values-list input.
+Interactive fzf uses
+.Ic --multi ;
+the numbered picker reads a comma-separated line of indices or literal values.
+Selected values are joined with
+.Fl -sep .
+Free-text inputs (no values list) are unaffected.
+.It Fl -sep Ar char
+Separator for joined multi-values (default
+.Ql , ) .
+Multi-character separators are accepted.
+.Fl -separator
+is a long alias.
+.It Fl -color Op Li = Ns Ar always | auto | never
+Colorize the prompt label (bold cyan) and the default hint (dim yellow) on
+stderr.
+Bare
+.Fl -color
+means
+.Ar always ;
+the default is
+.Ar auto
+(on when stderr is a tty and
+.Ev NO_COLOR
+is unset).
+ANSI codes in a
+.Li values
+list are rendered in the picker and stripped from the output, so
+.Li name=value
+is always plain text.
+.It Fl -label-color Ar spec
+Set the prompt-label color.
+.It Fl -default-color Ar spec
+Set the default-hint color.
+A spec is a named color
+.Po Li black , Li red , Li green , Li yellow , Li blue , Li magenta , Li cyan , Li white Pc
+with optional styles
+.Po Li bold , Li dim , Li underline Pc ,
+combinable as
+.Ql bold red ,
+or a raw SGR string like
+.Ql 1;31 .
+.It Fl -theme Ar name
+Bundle label and default colors:
+.Li default ,
+.Li dark ,
+.Li light ,
+.Li high-contrast .
+C
+.Li label-color= Ns / Ns Li default-color=
+keys override per spec.
+The on/off
+.Fl -color
+switch gates all of this.
+.It Fl -trim
+Trim leading and trailing whitespace from answers.
+Default is on for non-secrets and off for secrets
+(a secret with trailing spaces is a real case).
+.Fl -no-trim
+preserves whitespace.
+A C
+.Li trim=0 Ns / Ns Li trim=1
+key overrides per spec.
+Trimming runs after the read and before validation.
+.It Fl -validate Ar regex
+A POSIX ERE every free-text answer must match.
+A mismatch is an error in scripted mode and a cancel in interactive mode.
+A per-spec regex
+.Po B
+.Ql qr:
+field at any position, or C
+.Li validate=
+.Pc
+overrides this for one input and also applies to values-list picks;
+picks are otherwise exempt
+.Pq valid by construction .
+.Fl -validate-error Ar msg
+overrides the default
+.Ql invalid: does not match <pattern>
+message.
+Checked after
+.Fl -required .
+.It Fl -retry Ar n
+Re-prompt up to
+.Ar n
+times on a
+.Fl -required
+or
+.Fl -validate
+failure before canceling
+.Pq default 0 , fail fast .
+A C
+.Li retry= Ns Ar n
+key overrides per spec.
+The counter is per-input.
+Scripted mode ignores
+.Fl -retry
+.Pq no re-prompt loop over a pipe
+with a stderr notice.
+Each retry prints
+.Ql invalid: <reason>; try again (n left)
+on stderr.
+.It Fl -header Ar text
+A banner printed to stderr once before the first prompt
+.Pq colored with the label color when Fl -color is on ;
+for fzf it is also passed as fzf
+.Ql Fl -header .
+.Fl -header-file Ar path
+reads the banner from a file; the two are mutually exclusive and a missing file
+is a hard error.
+Multi-line banners are supported.
+.It Fl -width Ar n
+Tmux popup width in characters
+.Pq default 80 .
+.It Fl -height Ar n
+Tmux popup height in lines
+.Pq default 20 .
+.It Fl -auto-size
+Compute the popup width and height from the specs
+.Po max prompt+default+value width, number of inputs plus padding Pc ,
+capped at the terminal size.
+In-shell mode ignores these
+.Pq there is no popup .
+.It Fl -json
+Emit JSON Lines: one
+.Ql {"name":"...","value":"..."}
+object per input, on its own line, instead of
+.Ql name=value .
+.It Fl -json-array
+Emit a single JSON array on one line
+.Pq implies Fl -json .
+Values are JSON-escaped; secrets are cleartext.
+Multi-values stay a single joined string.
+.It Fl -save Ar file
+Write this run's
+.Li name=value
+answers to
+.Ar file
+on success
+.Pq atomic: temp plus rename .
+Secrets are skipped
+.Pq with a stderr warning
+unless
+.Fl -save-secrets
+is given.
+.It Fl -load Ar file
+Pre-fill defaults from a prior answers file
+.Po Li # comments and blank lines ignored Pc ;
+a missing file is a silent no-op.
+Precedence: typed answer \*[Gt] loaded value \*[Gt] spec default.
+.Fl -json
+and
+.Fl -save
+are mutually exclusive.
+A missing parent directory or non-writable
+.Fl -save
+target is a hard error.
+.It Fl -multiline
+Read a multi-line block until a sentinel line
+.Po default Ql . ; Fl -sentinel Ar s sets it, Ql Fl -sentinel= means EOF-terminated Pc .
+Blank lines are part of the block; the sentinel is excluded.
+C
+.Li multiline=1 Ns / Ns Li sentinel=
+per spec.
+Values-list inputs ignore it.
+.It Fl -timeout Ar n
+Cancel the run after
+.Ar n
+seconds
+.Po a background alarm + SIGALRM trap Pc .
+A timeout is a cancel
+.Pq exit non-zero, no stdout .
+Does not fire if input arrives in time.
+.It Fl -history Ar file
+Pre-fill each input's default with the last prior value for its name from
+.Ar file ,
+and append this run's
+.Li name=value
+answers on success
+.Po secrets skipped unless Fl -save-secrets Pc .
+A missing file is created on append.
+.It Fl -print-spec
+Normalize specs only, print sixteen tab-separated columns
+.Pq Li name , Li prompt , Li default , Li values , Li secret , Li multi , Li trim , Li required , Li validate , Li validate-error , Li retry , Li label-color , Li default-color , Li preview , Li multiline , Li sentinel ,
+and exit. Debug.
+.It Fl -specs-from Ar file
+Read B specs from
+.Ar file
+(one per line;
+.Ql #
+comments and blank lines are ignored) instead of positional args.
+Mutually exclusive with B positionals; combines with C (stdin is then the
+answer pipe for scripted B, or a tty for interactive B).
+A missing, unreadable, or spec-free file is a hard error (exit 1), unlike
+.Fl -load
+which is optional pre-fill.
+.El
+.Sh OUTPUT
+One
+.Ql name=value
+line per input, in order, on stdout.
+Prompts and the numbered list go to stderr.
+On cancel (Esc in fzf, EOF/Ctrl-D on a prompt, or a malformed spec),
+.Nm
+exits non-zero and prints nothing on stdout.
+.Sh EXIT STATUS
+.Bl -tag -width "1-2"
+.It 0
+All inputs collected; results on stdout.
+.It 1
+Cancel, or an error (e.g. an input with no resolvable default in scripted mode).
+.It 2
+Usage error.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width "TPROMPT_BIN"
+.It Ev TMUX
+If set (inside tmux) and
+.Xr tmux 1
+is available, the default render mode is
+.Fl -popup .
+.It Ev NO_COLOR
+If set, disables color in
+.Ar auto
+mode.
+.It Ev TPROMPT_BIN
+Used by the test suite to locate the binary.
+.El
+.Sh EXAMPLES
+.Bl -tag -width "tprompt --multi --sep , 'tags|t||a,b,c,d'"
+.It Nm Ql host|host to probe|localhost
+Prompt for one input with a default.
+.It Nm Ql port|port|22|22,80,443
+Prompt for an input chosen from a values list.
+.It Nm Ql *pw|Password:
+Prompt for a secret (hidden entry); the
+.Ql *
+is stripped.
+.It Nm Fl -multi Fl -sep Ql , Ql tags|t||a,b,c,d
+Allow several values from the list, joined with
+.Ql , .
+.It Nm Fl -color=always Ql host|h|localhost
+Colorize the prompt label and default hint.
+.It Nm Fl -print-spec Ql k|k|$USER
+Show the normalized record (default column expands
+.Ev $USER ) .
+.It Nm Fl -specs-from Ar deploy.txt
+Read B specs (one per line) from a file instead of argv.
+.El
+.Sh SEE ALSO
+.Lk ../README.md README ,
+.Lk ../DESIGN.md DESIGN ,
+.Lk ../docs/usage.md usage ,
+.Lk ../docs/integration.md integration ,
+.Lk ../docs/working-secret-color-multi.md working notes .
+.Sh AUTHORS
+.An tprompt
+is part of the tum project.
